@@ -13,20 +13,50 @@
 #define DUMP_PATH                "sdmc:/cache_dumps/"
 #define DUMP_BLOCKSIZE           0x800000
 
+/* Type definitions. */
+
+typedef struct {
+    u8 save_data_space_id;
+    u16 save_data_index;
+} CacheStorageInfo;
+
 /* Global variables. */
 
+static const u64 g_appTitleID = 0x0100C090153B4000ULL; // Crunchyroll Title ID -- may be changed before building
+
+static FsSaveDataFilter g_saveDataFilter = {
+    .filter_by_application_id = true,
+    .filter_by_save_data_type = true,
+    .filter_by_user_id = false,
+    .filter_by_system_save_data_id = false,
+    .filter_by_index = false,
+    .save_data_rank = FsSaveDataRank_Primary,
+    .padding = { 0, 0 },
+    .attr = {
+        .application_id = g_appTitleID,
+        .uid = {{ 0, 0 }},
+        .system_save_data_id = 0,
+        .save_data_type = FsSaveDataType_Cache,
+        .save_data_rank = FsSaveDataRank_Primary,
+        .save_data_index = 0,
+        .pad_x24 = 0,
+        .unk_x28 = 0,
+        .unk_x30 = 0,
+        .unk_x38 = 0
+    }
+};
+
 static PadState g_padState = {0};
-static const u64 g_crTitleID = 0x0100C090153B4000ULL;
-static NsApplicationControlData g_nsAppControlData = {0};
+
 static u8 *g_fileBuf = NULL;
 
 /* Function prototypes. */
 
 __attribute__((format(printf, 1, 2))) static void consolePrint(const char *text, ...);
 
-static bool utilsRetrieveCrunchyrollControlData(void);
-static bool utilsMountCrunchyrollCacheStorage(u16 idx);
-NX_INLINE void utilsUnmountCrunchyrollCacheStorage(void);
+static bool utilsGetApplicationCacheStorageInfo(CacheStorageInfo **out_cache_info, u64 *out_count);
+static bool utilsMountApplicationCacheStorage(const CacheStorageInfo *cache_info);
+NX_INLINE void utilsUnmountApplicationCacheStorage(void);
 
 static void utilsDumpDirectory(const char *path, u16 idx);
 static void utilsDumpFile(const char *path, u16 idx);
@@ -43,9 +73,9 @@ int main(int argc, char **argv)
     (void)argv;
     
     int ret = 0;
-    Result rc = 0;
     
-    NacpStruct *nacp = NULL;
+    CacheStorageInfo *cache_info = NULL;
+    u64 cache_info_count = 0;
     
     /* Configure input. */
     /* Up to 8 different, full controller inputs. */
@@ -59,69 +89,59 @@ int main(int argc, char **argv)
     /* Print message. */
     consolePrint(APP_TITLE ". Built on " BUILD_TIMESTAMP ".\n\n");
     
-    /* Initialize ns interface. */
-    consolePrint("Initializing ns... ");
-    
-    rc = nsInitialize();
-    if (R_FAILED(rc))
+    /* Check if we're running under HOS 6.0.0+. */
+    if (!hosversionAtLeast(6, 0, 0))
     {
-        consolePrint("\nnsInitialize failed! (0x%08X).\n", rc);
+        consolePrint("Horizon OS 6.0.0 or later required! Exiting...");
         ret = -1;
-        goto end1;
+        goto end;
     }
-    
-    consolePrint("OK!\n\n");
-    
-    /* Retrieve Crunchyroll's control data. */
-    consolePrint("Retrieving Crunchyroll's control data... ");
-    if (!utilsRetrieveCrunchyrollControlData()) goto end2;
-    consolePrint("OK!\n\n");
-    
-    /* Print cache storage properties. */
-    nacp = &(g_nsAppControlData.nacp);
-    consolePrint("Cache storage properties:\n\t- Size: 0x%lX.\n\t- Journal size: 0x%lX.\n\t- Data + Journal Max Size: 0x%lX.\n\t- Max index: %u.\n\n", \
-                 nacp->cache_storage_size, \
-                 nacp->cache_storage_journal_size, \
-                 nacp->cache_storage_data_and_journal_size_max, \
-                 nacp->cache_storage_index_max);
     
     /* Allocate memory for our file dump buffer. */
     g_fileBuf = malloc(DUMP_BLOCKSIZE);
     if (!g_fileBuf)
     {
-        consolePrint("\nFailed to allocate memory for file dump buffer!\n");
+        consolePrint("Failed to allocate memory for file dump buffer!");
         ret = -2;
-        goto end2;
+        goto end;
     }
     
-    /* Try to open any cache storage(s). */
-    for(u16 i = 0; i <= nacp->cache_storage_index_max; i++)
+    /* Get application cache storage info. */
+    if (!utilsGetApplicationCacheStorageInfo(&cache_info, &cache_info_count))
     {
+        ret = -3;
+        goto end;
+    }
+    
+    /* Mount available cache storages. */
+    for(u64 i = 0; i < cache_info_count; i++)
+    {
+        CacheStorageInfo *cur_cache_info = &(cache_info[i]);
+        
         /* Mount current cache storage. */
-        consolePrint("Mounting cache storage #%u... ", i);
-        if (!utilsMountCrunchyrollCacheStorage(i)) continue;
+        consolePrint("Mounting cache storage #%04u... ", cur_cache_info->save_data_index);
+        if (!utilsMountApplicationCacheStorage(cur_cache_info)) continue;
         consolePrint("OK!\n");
         
         /* Directory listing. */
-        consolePrint("Directory listing for cache storage #%u:\n", i);
-        utilsDumpDirectory(CACHE_STORAGE_MOUNT_NAME ":/", i);
+        consolePrint("Directory listing for cache storage #%04u:\n", cur_cache_info->save_data_index);
+        utilsDumpDirectory(CACHE_STORAGE_MOUNT_NAME ":/", cur_cache_info->save_data_index);
         consolePrint("\n");
         
         /* Unmount current cache storage. */
-        utilsUnmountCrunchyrollCacheStorage();
+        utilsUnmountApplicationCacheStorage();
     }
-    
-    /* Free file dump buffer. */
-    free(g_fileBuf);
     
     consolePrint("Process finished. Press any button to exit.");
     utilsWaitForButtonPress(0);
     
-end2:
-    /* Close ns interface. */
-    nsExit();
+end:
+    /* Free cache storage info (if needed). */
+    if (cache_info) free(cache_info);
     
-end1:
+    /* Free file dump buffer (if needed). */
+    if (g_fileBuf) free(g_fileBuf);
+    
     /* Wait some time (3 seconds). */
     svcSleepThread(3000000000ULL);
     
@@ -140,44 +160,113 @@ __attribute__((format(printf, 1, 2))) static void consolePrint(const char *text,
     consoleUpdate(NULL);
 }
 
-static bool utilsRetrieveCrunchyrollControlData(void)
+static bool utilsGetApplicationCacheStorageInfo(CacheStorageInfo **out_cache_info, u64 *out_count)
 {
-    Result rc = 0;
-    u64 write_size = 0;
-    
-    /* Retrieve ns application control data. */
-    rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, g_crTitleID, &g_nsAppControlData, sizeof(NsApplicationControlData), &write_size);
-    if (R_FAILED(rc))
+    if (!out_cache_info || !out_count)
     {
-        consolePrint("\nnsGetApplicationControlData failed for title ID \"%016lX\"! (0x%08X).\n", g_crTitleID, rc);
+        consolePrint("\nInvalid parameters!");
         return false;
     }
     
-    if (write_size < sizeof(NacpStruct))
+    Result rc = 0;
+    
+    FsSaveDataInfoReader sv_reader = {0};
+    FsSaveDataInfo sv_info = {0};
+    u64 total_entries = 0;
+    
+    CacheStorageInfo *cache_info = NULL, *tmp_cache_info = NULL;
+    u64 count = 0;
+    
+    bool success = false;
+    
+    for(u8 i = 0; i < 2; i++)
     {
-        consolePrint("\nRetrieved application control data buffer is too small! (0x%lX).\n", write_size);
+        FsSaveDataSpaceId save_data_space_id = (i == 0 ? FsSaveDataSpaceId_User : FsSaveDataSpaceId_SdUser);
+        
+        /* Retrieve save data info reader. */
+        rc = fsOpenSaveDataInfoReaderWithFilter(&sv_reader, save_data_space_id, &g_saveDataFilter);
+        if (R_FAILED(rc))
+        {
+            consolePrint("\nfsOpenSaveDataInfoReaderWithFilter failed! (0x%08X, %u).\n", rc, save_data_space_id);
+            continue;
+        }
+        
+        while(true)
+        {
+            /* Get current save data info entry. */
+            rc = fsSaveDataInfoReaderRead(&sv_reader, &sv_info, 1, (s64*)&total_entries);
+            if (R_FAILED(rc) || !total_entries) break;
+            
+            /* Reallocate cache info buffer. */
+            tmp_cache_info = realloc(cache_info, (count + 1) * sizeof(CacheStorageInfo));
+            if (!tmp_cache_info)
+            {
+                consolePrint("\nFailed to allocate memory for cache storage entry #%lu!\n", count + 1);
+                break;
+            }
+            
+            cache_info = tmp_cache_info;
+            tmp_cache_info = NULL;
+            
+            /* Update data. */
+            cache_info[count].save_data_space_id = sv_info.save_data_space_id;
+            cache_info[count].save_data_index = sv_info.save_data_index;
+            count++;
+        }
+        
+        /* Close save data info reader. */
+        fsSaveDataInfoReaderClose(&sv_reader);
+    }
+    
+    success = (cache_info != NULL && count);
+    if (success)
+    {
+        *out_cache_info = cache_info;
+        *out_count = count;
+    }
+    
+    return success;
+}
+
+static bool utilsMountApplicationCacheStorage(const CacheStorageInfo *cache_info)
+{
+    if (!cache_info)
+    {
+        consolePrint("\nInvalid parameters!\n");
+        return false;
+    }
+    
+    int res = 0;
+    Result rc = 0;
+    FsFileSystem fs = {0};
+    FsSaveDataAttribute attr = {0};
+    
+    /* Set attributes. */
+    attr.application_id = g_appTitleID;
+    attr.save_data_type = FsSaveDataType_Cache;
+    attr.save_data_index = cache_info->save_data_index;
+    
+    /* Open cache storage filesystem. */
+    rc = fsOpenSaveDataFileSystem(&fs, cache_info->save_data_space_id, &attr);
+    if (R_FAILED(rc))
+    {
+        consolePrint("\nfsOpenSaveDataFileSystem failed! (0x%08X, %u, %u).\n", rc, cache_info->save_data_space_id, cache_info->save_data_index);
+        return false;
+    }
+    
+    /* Mount filesystem through devoptab. */
+    res = fsdevMountDevice(CACHE_STORAGE_MOUNT_NAME, fs);
+    if (res == -1)
+    {
+        consolePrint("\nfsdevMountDevice failed! (%u, %u).\n", cache_info->save_data_space_id, cache_info->save_data_index);
+        fsFsClose(&fs);
         return false;
     }
     
     return true;
 }
 
-static bool utilsMountCrunchyrollCacheStorage(u16 idx)
-{
-    Result rc = 0;
-    
-    /* Open cache storage. */
-    rc = fsdevMountCacheStorage(CACHE_STORAGE_MOUNT_NAME, g_crTitleID, idx);
-    if (R_FAILED(rc))
-    {
-        consolePrint("\nfsdevMountCacheStorage failed! (0x%08X).\n\n", rc);
-        return false;
-    }
-    
-    return true;
-}
-
-NX_INLINE void utilsUnmountCrunchyrollCacheStorage(void)
+NX_INLINE void utilsUnmountApplicationCacheStorage(void)
 {
     fsdevUnmountDevice(CACHE_STORAGE_MOUNT_NAME);
 }
@@ -258,7 +347,7 @@ static void utilsDumpFile(const char *path, u16 idx)
     }
     
     /* Generate output path. */
-    snprintf(sdmc_path, sizeof(sdmc_path), DUMP_PATH "%016lX/%04u%s", g_crTitleID, idx, pch + 1);
+    snprintf(sdmc_path, sizeof(sdmc_path), DUMP_PATH "%016lX/%04u%s", g_appTitleID, idx, pch + 1);
     
     /* Create directory tree. */
     utilsCreateDirectoryTree(sdmc_path, false);
