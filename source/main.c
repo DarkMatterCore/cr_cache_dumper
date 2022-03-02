@@ -46,6 +46,8 @@ static FsSaveDataFilter g_saveDataFilter = {
     }
 };
 
+static AppletType g_programAppletType = AppletType_None;
+static bool g_longRunningProcess = false;
 static PadState g_padState = {0};
 
 static u8 *g_fileBuf = NULL;
@@ -53,6 +55,10 @@ static u8 *g_fileBuf = NULL;
 /* Function prototypes. */
 
 __attribute__((format(printf, 1, 2))) static void consolePrint(const char *text, ...);
+
+NX_INLINE bool utilsAppletModeCheck(void);
+static void utilsChangeHomeButtonBlockStatus(bool block);
+static void utilsSetLongRunningProcessState(bool state);
 
 static bool utilsGetApplicationCacheStorageInfo(CacheStorageInfo **out_cache_info, u64 *out_count);
 static bool utilsMountApplicationCacheStorage(const CacheStorageInfo *cache_info);
@@ -73,6 +79,7 @@ int main(int argc, char **argv)
     (void)argv;
     
     int ret = 0;
+    Result rc = 0;
     
     CacheStorageInfo *cache_info = NULL;
     u64 cache_info_count = 0;
@@ -86,8 +93,22 @@ int main(int argc, char **argv)
     /* Initialize console output. */
     consoleInit(NULL);
     
+    /* Get applet type. */
+    g_programAppletType = appletGetAppletType();
+    
+    /* Enable video recording if we're running under title override mode. */
+    if (!utilsAppletModeCheck())
+    {
+        bool flag = false;
+        rc = appletIsGamePlayRecordingSupported(&flag);
+        if (R_SUCCEEDED(rc) && flag) appletInitializeGamePlayRecording();
+    }
+    
     /* Print message. */
     consolePrint(APP_TITLE ". Built on " BUILD_TIMESTAMP ".\n\n");
+    
+    /* Set long running process state. */
+    utilsSetLongRunningProcessState(true);
     
     /* Check if we're running under HOS 6.0.0+. */
     if (!hosversionAtLeast(6, 0, 0))
@@ -145,6 +166,9 @@ end:
     /* Wait some time (3 seconds). */
     svcSleepThread(3000000000ULL);
     
+    /* Unset long running process state. */
+    utilsSetLongRunningProcessState(false);
+    
     /* Deinitialize console output. */
     consoleExit(NULL);
     
@@ -158,6 +182,39 @@ __attribute__((format(printf, 1, 2))) static void consolePrint(const char *text,
     vfprintf(stdout, text, v);
     va_end(v);
     consoleUpdate(NULL);
+}
+
+NX_INLINE bool utilsAppletModeCheck(void)
+{
+    return (g_programAppletType > AppletType_Application && g_programAppletType < AppletType_SystemApplication);
+}
+
+static void utilsChangeHomeButtonBlockStatus(bool block)
+{
+    /* Only change HOME button blocking status if we're running as a regular application or a system application. */
+    if (utilsAppletModeCheck()) return;
+    
+    if (block)
+    {
+        appletBeginBlockingHomeButtonShortAndLongPressed(0);
+    } else {
+        appletEndBlockingHomeButtonShortAndLongPressed();
+    }
+}
+
+static void utilsSetLongRunningProcessState(bool state)
+{
+    /* Don't proceed if the requested state matches the current one. */
+    if (state == g_longRunningProcess) return;
+    
+    /* Change HOME button block status. */
+    utilsChangeHomeButtonBlockStatus(state);
+    
+    /* (Un)set screen dimming and auto sleep. */
+    appletSetMediaPlaybackState(state);
+    
+    /* Update flag. */
+    g_longRunningProcess = state;
 }
 
 static bool utilsGetApplicationCacheStorageInfo(CacheStorageInfo **out_cache_info, u64 *out_count)
